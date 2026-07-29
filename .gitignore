@@ -1,0 +1,32 @@
+# Виртуальное окружение
+venv/
+env/
+
+# Секретные данные
+.env
+
+# Python кэш
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Логи
+*.log
+# Тяжёлые бинарники и медиа (не для git)
+*.deb
+*.exe
+*.mp4
+*.avi
+*.mov
+*.zip
+*.tar.gz
+*.deb.*

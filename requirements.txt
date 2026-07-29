@@ -1,0 +1,17 @@
+# Telegram-бот
+python-telegram-bot
+
+# База данных: PostgreSQL + SQLAlchemy
+SQLAlchemy
+psycopg2-binary
+
+# Переменные окружения (.env)
+python-dotenv
+
+# HTTP-клиенты: YandexGPT REST API + резервный канал парсера
+httpx
+requests
+
+# Парсинг документации: Selenium (основной) + BeautifulSoup (разбор HTML)
+selenium
+beautifulsoup4
