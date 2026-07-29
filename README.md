@@ -76,8 +76,8 @@ bitrix24-rag-bot/
 ## Установка
 
 ```bash
-git clone https://github.com/yooHOLAA/bitrix24-rag-bot.git
-cd bitrix24-rag-bot
+git clone https://github.com/yooHOLAA/bitrix24-rag-TGbot.git
+cd bitrix24-rag-TGbot
 python3 -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 pip install -r requirements.txt
