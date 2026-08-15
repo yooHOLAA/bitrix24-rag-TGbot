@@ -1,39 +1,32 @@
-import os
-import re
+"""Модуль Yandex Assistant: RAG с векторным поиском (embeddings).
+
+Эмбеддинги базы знаний хранятся в векторном хранилище (vector_store.json)
+и загружаются при старте, чтобы бот отвечал мгновенно.
+"""
+import asyncio
 import json
 import logging
 from pathlib import Path
-from dotenv import load_dotenv
-import httpx
+from typing import List, Dict
 
-load_dotenv()
+import httpx
+import numpy as np
+
+from ..config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# --- Настройки YandexGPT ---
-FOLDER_ID = os.getenv("YANDEX_FOLDER_ID", "")
-API_KEY = os.getenv("YANDEX_API_KEY", "")
-YANDEXGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-# Актуальная модель. Для YandexGPT 5 явно: f"gpt://{FOLDER_ID}/yandexgpt-5/latest"
-MODEL_URI = f"gpt://{FOLDER_ID}/yandexgpt/latest"
-
-# Путь к базе знаний (корень проекта, независимо от cwd)
 KB_PATH = Path(__file__).resolve().parents[2] / "bitrix_api_docs.json"
+CACHE_PATH = Path(__file__).resolve().parents[2] / "vector_store.json"
 
-# Стоп-слова, которые шумят при поиске (применяются только к вопросу)
-STOP_WORDS = {
-    "как", "что", "где", "когда", "почему", "зачем", "какой", "какая", "какие",
-    "мне", "можно", "нужно", "через", "метод", "метода", "методы", "api",
-    "битрикс", "bitrix", "битрикс24", "the", "a", "an", "is", "to", "of", "in",
-    "и", "в", "на", "с", "по", "для", "или", "не", "это", "его", "её",
-}
+_EMBEDDINGS_CACHE = None
 
-# База знаний в памяти (ленивая загрузка)
-_KB = None
+
+def get_settings_safe():
+    return get_settings()
 
 
 def _flatten_params(params, max_params=15):
-    """Превращает список параметров в читаемый текст (обрезаем, чтобы не раздувать промпт)."""
     lines = []
     for p in params[:max_params]:
         name = p.get("name", "").strip()
@@ -45,84 +38,129 @@ def _flatten_params(params, max_params=15):
 
 
 def get_kb():
-    """Загружает базу знаний из JSON в память (один раз)."""
-    global _KB
-    if _KB is not None:
-        return _KB
-    _KB = []
     if not KB_PATH.exists():
         logger.warning("База знаний не найдена: %s", KB_PATH)
-        return _KB
+        return []
     with open(KB_PATH, encoding="utf-8") as f:
         data = json.load(f)
+    kb = []
     for section_title, section in data.items():
         for method in section.get("methods", []):
             params_text = _flatten_params(method.get("params", []))
-            _KB.append({
+            kb.append({
                 "section": section_title,
                 "title": method.get("title", ""),
                 "url": method.get("url", ""),
                 "description": method.get("description", ""),
                 "params_text": params_text,
-                # Текст для поиска по ключевым словам
-                "search_text": (
-                    method.get("title", "") + " " +
-                    method.get("description", "") + " " +
-                    params_text
-                ).lower(),
             })
-    logger.info("База знаний загружена: %d методов", len(_KB))
-    return _KB
+    logger.info("База знаний загружена: %d методов", len(kb))
+    return kb
 
 
-def reload_kb():
-    """Перечитывает базу знаний с диска (после обновления парсером)."""
-    global _KB
-    _KB = None
-    return get_kb()
+async def get_embedding(text: str, model_uri: str, max_retries: int = 3) -> np.ndarray:
+    settings = get_settings_safe()
+    url = "https://llm.api.cloud.yandex.net/foundationModels/v1/textEmbedding"
+    headers = {
+        "Authorization": f"Api-Key {settings.YANDEX_API_KEY}",
+        "x-folder-id": settings.YANDEX_FOLDER_ID,
+    }
+    payload = {"modelUri": model_uri, "text": text}
+    for attempt in range(max_retries):
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(url, json=payload, headers=headers)
+                r.raise_for_status()
+                emb = r.json().get("embedding", [])
+                if emb:
+                    return np.array(emb, dtype=np.float32)
+                return np.array([], dtype=np.float32)
+        except Exception as e:
+            logger.warning("Эмбеддинг, попытка %d/%d: %s", attempt + 1, max_retries, type(e).__name__)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)
+    return np.array([], dtype=np.float32)
 
 
-def _tokens(text):
-    """Токены вопроса без стоп-слов."""
-    words = re.findall(r"[a-zа-яё0-9_]+", text.lower())
-    return [w for w in words if w not in STOP_WORDS and len(w) > 1]
+def _save_cache():
+    global _EMBEDDINGS_CACHE
+    data = [{"doc": i["doc"], "embedding": i["embedding"].tolist()} for i in (_EMBEDDINGS_CACHE or [])]
+    with open(CACHE_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    logger.info("Векторное хранилище сохранено: %s (%d векторов)", CACHE_PATH, len(data))
 
 
-def retrieve(question, top_k=3):
-    """R = Retrieval: ищем релевантные методы по ключевым словам."""
+def _load_cache():
+    if not CACHE_PATH.exists():
+        return None
+    try:
+        with open(CACHE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        cache = [{"doc": i["doc"], "embedding": np.array(i["embedding"], dtype=np.float32)} for i in data]
+        logger.info("Векторное хранилище загружено из файла: %d векторов", len(cache))
+        return cache
+    except Exception as e:
+        logger.warning("Не удалось загрузить кэш: %s", e)
+        return None
+
+
+async def build_embeddings_cache(force: bool = False):
+    """Загружает кэш из файла, либо строит с нуля и сохраняет."""
+    global _EMBEDDINGS_CACHE
+    if _EMBEDDINGS_CACHE is not None:
+        return _EMBEDDINGS_CACHE
+    if not force:
+        cached = _load_cache()
+        if cached:
+            _EMBEDDINGS_CACHE = cached
+            return _EMBEDDINGS_CACHE
+
+    logger.info("Строю векторное хранилище с нуля...")
+    settings = get_settings_safe()
     kb = get_kb()
-    if not kb:
+    _EMBEDDINGS_CACHE = []
+    total = len(kb)
+    for i, doc in enumerate(kb, 1):
+        text = f"{doc['title']}. {doc['description']} {doc['params_text'][:300]}"
+        emb = await get_embedding(text, settings.embedding_doc_uri)
+        if emb.size > 0:
+            _EMBEDDINGS_CACHE.append({"doc": doc, "embedding": emb})
+        if i % 10 == 0 or i == total:
+            logger.info("Прогресс: %d/%d", i, total)
+        if i < total:
+            await asyncio.sleep(0.3)
+    _save_cache()
+    return _EMBEDDINGS_CACHE
+
+
+def cosine_similarity(a, b):
+    if a.size == 0 or b.size == 0:
+        return 0.0
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+async def retrieve_embeddings(question: str, top_k: int = 3):
+    cache = await build_embeddings_cache()
+    if not cache:
         return []
-
-    q_tokens = _tokens(question)
-    # Если в вопросе есть явное имя метода (crm.lead.add) — даём ему огромный приоритет
-    method_in_q = re.search(r"[a-zа-яё]+\.[a-zа-яё]+(?:\.[a-zа-яё]+)+", question, re.IGNORECASE)
-    method_name = method_in_q.group(0).lower() if method_in_q else None
-
-    scored = []
-    for doc in kb:
-        score = 0
-        if method_name and method_name in doc["title"].lower():
-            score += 1000  # точное попадание по имени метода
-        for w in q_tokens:
-            if w in doc["search_text"]:
-                score += 1
-        if score > 0:
-            scored.append((score, doc))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
+    settings = get_settings_safe()
+    q_emb = await get_embedding(question, settings.embedding_query_uri)
+    if q_emb.size == 0:
+        return []
+    scored = sorted(
+        ((cosine_similarity(q_emb, item["embedding"]), item["doc"]) for item in cache),
+        key=lambda x: x[0], reverse=True,
+    )
     return [doc for _, doc in scored[:top_k]]
 
 
-def _build_context(docs):
-    """Собираем текст контекста из найденных методов."""
+def _build_context(docs: List[Dict]) -> str:
     blocks = []
     for i, doc in enumerate(docs, 1):
-        block = (
-            f"[{i}] Раздел: {doc['section']}\n"
-            f"Метод: {doc['title']}\n"
-            f"Описание: {doc['description'] or '(нет)'}\n"
-        )
+        block = f"[{i}] Раздел: {doc['section']}\nМетод: {doc['title']}\nОписание: {doc['description'] or '(нет)'}\n"
         if doc["params_text"]:
             block += f"Параметры:\n{doc['params_text']}\n"
         blocks.append(block)
@@ -130,71 +168,55 @@ def _build_context(docs):
 
 
 SYSTEM_PROMPT = (
-    "Ты — эксперт по REST API Битрикс24. Ты отвечаешь разработчикам на вопросы "
-    "СТРОГО на основе предоставленной ниже документации. Правила:\n"
-    "1. Отвечай только по фактам из документации. Не придумывай методы и параметры.\n"
-    "2. Если в документации нет ответа — прямо скажи: «В доступной документации этого нет».\n"
-    "3. Отвечай кратко, по делу, на русском языке. Приводи имена методов и параметров.\n"
-    "4. Если уместно — покажи короткий пример структуры запроса."
+    "Ты — эксперт по REST API Битрикс24. Отвечай СТРОГО по предоставленной документации. "
+    "Не придумывай методы. Если ответа нет — скажи «В доступной документации этого нет». "
+    "Отвечай кратко, на русском, приводи имена методов и параметров."
 )
 
 
-async def ask_yandexgpt(question, context):
-    """G = Generation: отправляем контекст + вопрос в YandexGPT."""
-    if not API_KEY or not FOLDER_ID:
-        return "⚠️ В .env не заданы YANDEX_API_KEY или YANDEX_FOLDER_ID."
-
-    user_text = (
-        f"ДОКУМЕНТАЦИЯ:\n{context}\n\n"
-        f"ВОПРОС РАЗРАБОТЧИКА: {question}\n\n"
-        f"ОТВЕТ:"
-    )
+async def ask_yandexgpt(question: str, context: str) -> str:
+    settings = get_settings_safe()
+    url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
     payload = {
-        "modelUri": MODEL_URI,
+        "modelUri": settings.yandexgpt_model_uri,
         "completionOptions": {"stream": False, "temperature": 0.3},
         "messages": [
             {"role": "system", "text": SYSTEM_PROMPT},
-            {"role": "user", "text": user_text},
+            {"role": "user", "text": f"ДОКУМЕНТАЦИЯ:\n{context}\n\nВОПРОС: {question}\n\nОТВЕТ:"},
         ],
     }
     headers = {
-        "Authorization": f"Api-Key {API_KEY}",
-        "x-folder-id": FOLDER_ID,
+        "Authorization": f"Api-Key {settings.YANDEX_API_KEY}",
+        "x-folder-id": settings.YANDEX_FOLDER_ID,
     }
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(YANDEXGPT_URL, json=payload, headers=headers)
-            r.raise_for_status()
-            data = r.json()
-            return data["result"]["alternatives"][0]["message"]["text"].strip()
-    except httpx.HTTPStatusError as e:
-        body = e.response.text[:300]
-        logger.error("YandexGPT HTTP %s: %s", e.response.status_code, body)
-        if e.response.status_code in (401, 403):
-            return ("⚠️ Ошибка доступа к YandexGPT (401/403). Проверь: "
-                    "1) API-ключ в .env; 2) у сервисного аккаунта роль ai.editor; "
-                    "3) у ключа область действия yc.ai.foundationModels.execute.")
-        return f"⚠️ YandexGPT вернул ошибку {e.response.status_code}: {body}"
-    except Exception as e:
-        logger.exception("Ошибка YandexGPT: %s", e)
-        return f"⚠️ Не удалось получить ответ от YandexGPT: {type(e).__name__}"
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                r = await client.post(url, json=payload, headers=headers)
+                r.raise_for_status()
+                return r.json()["result"]["alternatives"][0]["message"]["text"].strip()
+        except httpx.HTTPStatusError as e:
+            logger.error("YandexGPT HTTP %s: %s", e.response.status_code, e.response.text[:300])
+            return f"⚠️ YandexGPT вернул ошибку {e.response.status_code}."
+        except Exception as e:
+            logger.warning("YandexGPT попытка %d/3: %s", attempt + 1, type(e).__name__)
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+    return "⚠️ Не удалось связаться с YandexGPT (сеть нестабильна). Попробуй ещё раз через пару секунд."
 
 
-async def answer(question):
-    """Главная функция: RAG = retrieve + generate."""
-    docs = retrieve(question)
+async def answer(question: str) -> str:
+    docs = await retrieve_embeddings(question)
     if not docs:
         return ("🤔 В базе знаний не нашёл методов по этому вопросу. "
-                "Попробуй указать имя метода (например, crm.lead.add) или "
-                "обнови базу командой /update.")
-    context = _build_context(docs)
-    return await ask_yandexgpt(question, context)
+                "Попробуй указать имя метода (например, crm.lead.add).")
+    return await ask_yandexgpt(question, _build_context(docs))
 
 
 async def update_kb_via_parser():
-    """Обновление базы знаний: запускает парсер и перечитывает JSON."""
-    import asyncio
     from ..parser.bitrix_parser import main as parser_main
-    await asyncio.to_thread(parser_main)  # парсер синхронный -> в отдельный поток
-    kb = reload_kb()
-    return len(kb)
+    await asyncio.to_thread(parser_main)
+    global _EMBEDDINGS_CACHE
+    _EMBEDDINGS_CACHE = None
+    await build_embeddings_cache(force=True)
+    return len(get_kb())

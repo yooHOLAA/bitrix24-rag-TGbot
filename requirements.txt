@@ -15,3 +15,9 @@ requests
 # Парсинг документации: Selenium (основной) + BeautifulSoup (разбор HTML)
 selenium
 beautifulsoup4
+
+# Конфигурация и валидация настроек
+pydantic-settings
+
+# Векторный поиск (embeddings)
+numpy

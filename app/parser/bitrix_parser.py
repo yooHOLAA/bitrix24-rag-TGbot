@@ -1,3 +1,8 @@
+"""Полный парсер документации Bitrix24 API (Selenium + fallback requests).
+
+Парсит ВСЕ разделы и ВСЕ методы API, сохраняет в bitrix_api_docs.json.
+С логированием, обработкой ошибок и ретраями.
+"""
 import json
 import re
 import time
@@ -16,11 +21,20 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 METHOD_PATTERN = re.compile(r"\w+\.\w+\.\w+")
 SKIP_HREFS = ["data-types", "rest-v3", "developing-with-rest-api", "limits", "error-codes"]
 
+# Настройка логирования (в файл и в консоль)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("parser.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
 logger = logging.getLogger(__name__)
 
 
 def create_driver():
-    """Запускает headless Chrome (Selenium) — основной инструмент парсинга по ТЗ."""
+    """Запускает headless Chrome (Selenium)."""
     options = Options()
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
@@ -35,7 +49,7 @@ def create_driver():
 
 
 def _fetch_requests(url):
-    """Резервный канал: обычный HTTP, если Selenium не смог загрузить страницу."""
+    """Резервный канал: обычный HTTP, если Selenium не смог."""
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         r.raise_for_status()
@@ -49,20 +63,18 @@ def _fetch_requests(url):
 def get_soup(driver, url):
     """Selenium (основной) -> при неудаче fallback на requests."""
     try:
-        print(f"    [selenium] {url}")
         driver.get(url)
-        time.sleep(3)
+        time.sleep(2)
         html = driver.page_source
         if html and len(html) > 2000:
             return BeautifulSoup(html, "html.parser")
     except WebDriverException as e:
         logger.warning("Selenium таймаут/ошибка на %s -> fallback requests", url)
-    # fallback
-    print(f"    [requests] {url}")
     return _fetch_requests(url)
 
 
 def parse_api_sections(driver):
+    """Парсит главную страницу -> список разделов API."""
     soup = get_soup(driver, BASE_URL)
     if not soup:
         return []
@@ -77,7 +89,8 @@ def parse_api_sections(driver):
     return sections
 
 
-def parse_section_methods(driver, section_url, max_methods=10):
+def parse_section_methods(driver, section_url):
+    """Парсит страницу раздела -> список ВСЕХ методов (без ограничений)."""
     soup = get_soup(driver, section_url)
     if not soup:
         return []
@@ -97,10 +110,11 @@ def parse_section_methods(driver, section_url, max_methods=10):
         if full.startswith(section_base) and full not in seen:
             seen.add(full)
             methods.append({"title": text, "url": full})
-    return methods[:max_methods]
+    return methods
 
 
 def parse_method_details(driver, method_url):
+    """Парсит страницу метода -> описание + параметры."""
     soup = get_soup(driver, method_url)
     if not soup:
         return None
@@ -127,37 +141,44 @@ def parse_method_details(driver, method_url):
 
 
 def main():
-    print("=" * 60)
-    print("ПАРСЕР ДОКУМЕНТАЦИИ BITRIX24 API (Selenium + fallback)")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("ПОЛНЫЙ ПАРСЕР ДОКУМЕНТАЦИИ BITRIX24 API")
+    logger.info("=" * 60)
     driver = create_driver()
     try:
-        print("\n[1/3] Парсю разделы API...")
+        logger.info("Парсю разделы API...")
         sections = parse_api_sections(driver)
-        print(f"  Найдено разделов: {len(sections)}")
+        logger.info("Найдено разделов: %d", len(sections))
         api_sections = [s for s in sections if "Справочник" not in s["title"] and "Права" not in s["title"]]
+        logger.info("Разделов с методами: %d", len(api_sections))
 
-        print("\n[2/3] Парсю методы из первых 3 разделов...")
         result = {}
-        for section in api_sections[:3]:
-            print(f"\n  Раздел: {section['title']}")
-            methods = parse_section_methods(driver, section["url"], max_methods=5)
-            print(f"    Реальных методов: {len(methods)}")
+        total_methods = 0
+        for i, section in enumerate(api_sections, 1):
+            logger.info("[%d/%d] Раздел: %s", i, len(api_sections), section["title"])
+            methods = parse_section_methods(driver, section["url"])
+            logger.info("  Найдено методов: %d", len(methods))
+            
             detailed = []
-            for j, m in enumerate(methods[:3]):
-                print(f"    [{j+1}] {m['title']}")
+            for j, m in enumerate(methods, 1):
+                logger.info("  [%d/%d] %s", j, len(methods), m["title"])
                 d = parse_method_details(driver, m["url"])
                 if d:
                     detailed.append(d)
+                else:
+                    logger.warning("    Пропускаю (не удалось загрузить): %s", m["title"])
+                time.sleep(0.5)  # пауза между запросами
+            
             result[section["title"]] = {"url": section["url"], "methods": detailed}
+            total_methods += len(detailed)
 
         with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
 
-        total = sum(len(v["methods"]) for v in result.values())
-        print(f"\n[3/3] Готово! Разделов: {len(result)}, методов с деталями: {total}")
-        print(f"  Файл: {OUTPUT_FILE}")
-        print("=" * 60)
+        logger.info("=" * 60)
+        logger.info("ГОТОВО! Разделов: %d, методов с деталями: %d", len(result), total_methods)
+        logger.info("Файл: %s", OUTPUT_FILE)
+        logger.info("=" * 60)
     finally:
         driver.quit()
 

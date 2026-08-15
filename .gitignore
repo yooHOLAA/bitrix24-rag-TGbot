@@ -30,3 +30,5 @@ Thumbs.db
 *.zip
 *.tar.gz
 *.deb.*
+debug_embeddings.py
+test_embeddings.py

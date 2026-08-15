@@ -1,22 +1,13 @@
-import os
-from dotenv import load_dotenv
+"""Модуль базы данных: engine, сессии, создание таблиц."""
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-# Загружаем секреты из .env
-load_dotenv()
+from ..config import get_settings
 
-DB_HOST = os.getenv("DB_HOST")
-DB_PORT = os.getenv("DB_PORT")
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
+settings = get_settings()
 
-# URL подключения к PostgreSQL
-DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-
-# Движок и фабрика сессий
-engine = create_engine(DATABASE_URL)
+# Движок и фабрика сессий (URL берётся из Settings)
+engine = create_engine(settings.database_url)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 # Единый Base для всех моделей
@@ -24,7 +15,7 @@ Base = declarative_base()
 
 
 def get_db():
-    """Единая зависимость для получения сессии БД (используется везде)."""
+    """Единая зависимость для получения сессии БД."""
     db = SessionLocal()
     try:
         yield db
